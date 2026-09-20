@@ -29,27 +29,29 @@ import java.util.HexFormat;
 import java.util.Map;
 import java.util.Set;
 
-// FUSE ("Filesystem in Userspace") lets an ordinary process implement a filesystem:
-// the Linux kernel forwards every syscall a program makes against the mounted directory
-// (open, read, write, readdir, ...) to this process as a method call, and whatever this
-// class returns becomes the syscall's result. So SpyFs doesn't store any file data itself -
-// it just mirrors reads/writes onto real files under `storage` and logs what it sees.
-// jfuse is the Java binding: it turns kernel calls into calls on the FuseOperations methods
-// below, using the libfuse C library under the hood.
+// FUSE ("Filesystem in Userspace") позволяет обычному процессу реализовать файловую систему:
+// ядро Linux перенаправляет каждый системный вызов программы к смонтированному каталогу
+// (open, read, write, readdir, ...) этому процессу в виде вызова метода, а то, что вернёт
+// этот класс, становится результатом системного вызова. Поэтому SpyFs сам данные не хранит -
+// он лишь зеркалирует чтения/записи в настоящие файлы под `storage` и логирует, что видит.
+// jfuse - это Java-обвязка: она превращает вызовы ядра в вызовы методов FuseOperations
+// ниже, используя под капотом C-библиотеку libfuse.
 @Slf4j
 @RequiredArgsConstructor
 public class SpyFs implements FuseOperations {
 
-    // Once a file handle has this many consecutive bytes buffered, we log it as a "part" -
-    // a stand-in for an S3 multipart upload part, which also has a minimum size.
+    // Как только у дескриптора накопилось столько последовательных байт, мы логируем это как
+    // "часть" (part) - прообраз части multipart-загрузки в S3, у которой тоже есть минимальный
+    // размер.
     private static final int PART_MIN = 5 * 1024 * 1024;
 
     private final Errno errno;
     private final Path storage;
 
-    // FUSE identifies an open file by an opaque "file handle" number that *we* choose in
-    // open()/create() and the kernel then echoes back on every later call (read, write,
-    // release, ...) via fi.getFh(). This map is how we find our per-open state again.
+    // FUSE опознаёт открытый файл по непрозрачному номеру "file handle", который *мы сами*
+    // выбираем в open()/create(), а ядро затем возвращает нам же в каждом следующем вызове
+    // (read, write, release, ...) через fi.getFh(). По этой карте мы находим своё состояние
+    // для конкретного открытия файла.
     private final Map<Long, Handle> handles = new HashMap<>();
     private long nextFh = 1;
 
@@ -61,12 +63,12 @@ public class SpyFs implements FuseOperations {
         Path mountPoint = Path.of(args[0]);
         Path storage = Path.of(args[1]);
 
-        // builder.errno() gives us the platform's actual errno.h constants (EIO, ENOENT, ...),
-        // since their numeric values differ between Linux/macOS/Windows.
+        // builder.errno() даёт нам настоящие константы errno.h платформы (EIO, ENOENT, ...),
+        // так как их числовые значения различаются между Linux/macOS/Windows.
         var builder = Fuse.builder();
         var fuse = builder.build(new SpyFs(builder.errno(), storage));
-        // If the JVM is killed (Ctrl+C, `docker stop`/SIGTERM), politely unmount first instead
-        // of leaving a dangling mountpoint behind.
+        // Если JVM убивают (Ctrl+C, `docker stop`/SIGTERM), сначала аккуратно размонтируемся,
+        // а не оставляем висячую точку монтирования.
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
                 fuse.close();
@@ -75,16 +77,17 @@ public class SpyFs implements FuseOperations {
             }
         }));
 
-        // "-s" tells libfuse to run single-threaded: the kernel sends us one request at a
-        // time, so read()/write()/etc. never run concurrently and need no locking. jfuse adds
-        // "-f" (stay in foreground) and the mountpoint itself automatically.
+        // "-s" велит libfuse работать в один поток: ядро присылает нам по одному запросу за
+        // раз, поэтому read()/write()/и т.д. никогда не выполняются параллельно и не нужна
+        // блокировка. "-f" (остаться на переднем плане) и саму точку монтирования jfuse
+        // добавляет сам.
         String[] flags = new String[args.length - 2 + 1];
         flags[0] = "-s";
         System.arraycopy(args, 2, flags, 1, args.length - 2);
 
-        // mount() blocks until the filesystem is actually attached, then returns while the
-        // FUSE event loop keeps running on a background thread. Without the join() below the
-        // JVM would just exit immediately and tear the mount back down.
+        // mount() блокируется, пока файловая система реально не примонтируется, а затем
+        // возвращает управление, пока цикл обработки событий FUSE продолжает работать в
+        // фоновом потоке. Без join() ниже JVM тут же завершилась бы и размонтировала ФС.
         fuse.mount("fuse", mountPoint, flags);
         Thread.currentThread().join();
     }
@@ -94,9 +97,9 @@ public class SpyFs implements FuseOperations {
         return errno;
     }
 
-    // jfuse only wires up (registers with libfuse) the operations listed here; anything else
-    // - subdirectories, symlinks, xattrs, permission checks, ... - is simply never called, and
-    // the kernel gets the generic "not implemented" error (ENOSYS) on its own.
+    // jfuse регистрирует в libfuse только перечисленные здесь операции; всё остальное -
+    // подкаталоги, симлинки, xattr, проверки прав, ... - просто никогда не вызывается, и ядро
+    // само получает общую ошибку "не реализовано" (ENOSYS).
     @Override
     public Set<Operation> supportedOperations() {
         return EnumSet.of(
@@ -108,21 +111,23 @@ public class SpyFs implements FuseOperations {
         );
     }
 
-    // Every FUSE callback receives an absolute path *inside the mount* (e.g. "/report.bin"),
-    // never a real filesystem path. We keep a flat mount, so mapping it onto the backing
-    // storage directory is just stripping the leading "/".
+    // В каждый вызов FUSE приходит абсолютный путь *внутри точки монтирования*
+    // (например, "/report.bin"), а не настоящий путь в файловой системе. У нас плоское
+    // монтирование, поэтому отображение на каталог-хранилище - это просто отбрасывание
+    // ведущего "/".
     private Path resolve(String path) {
         return storage.resolve(path.substring(1));
     }
 
-    // getattr is the FUSE equivalent of stat(2): the kernel calls it constantly (before open,
-    // before read, for `ls -l`, ...) to learn whether a path exists and, if so, its type/size.
-    // We fill in just enough of the `stat` struct for a flat read/write filesystem to work:
-    // the entry type bit (directory vs. regular file) or'd with a fixed permission mode, a
-    // link count, and - for files - the real size on disk.
-    // jfuse itself probes "/jfuse_mount_probe" right after mounting to confirm the mount is
-    // live; since no such file exists in storage, that probe naturally (and correctly) gets
-    // ENOENT here, same as any other missing name.
+    // getattr - это аналог stat(2) в мире FUSE: ядро вызывает его постоянно (перед open,
+    // перед read, для `ls -l`, ...), чтобы узнать, существует ли путь, и если да - его тип и
+    // размер. Мы заполняем ровно то, что нужно плоской read/write-файловой системе: бит типа
+    // записи (каталог или обычный файл), объединённый через "или" с фиксированными правами,
+    // счётчик ссылок и - для файлов - реальный размер на диске.
+    // Сам jfuse сразу после монтирования опрашивает "/jfuse_mount_probe", чтобы убедиться,
+    // что монтирование действительно работает; поскольку такого файла в хранилище нет, этот
+    // запрос закономерно (и правильно) получает здесь ENOENT, как и любое другое отсутствующее
+    // имя.
     @Override
     public int getattr(String path, Stat stat, FileInfo fi) {
         log.trace("GETATTR path={}", path);
@@ -133,8 +138,8 @@ public class SpyFs implements FuseOperations {
         }
         Path file = resolve(path);
         if (!Files.isRegularFile(file)) {
-            // A FUSE operation reports failure by returning the *negative* errno value
-            // (e.g. -ENOENT), never by throwing - that's how libfuse expects errors back.
+            // Операция FUSE сообщает об ошибке, возвращая *отрицательное* значение errno
+            // (например, -ENOENT), а не бросая исключение - именно так libfuse ждёт ошибки.
             return -errno.enoent();
         }
         try {
@@ -148,10 +153,11 @@ public class SpyFs implements FuseOperations {
         }
     }
 
-    // readdir answers `ls`/`readdir(3)` on a directory. Since this is the *only* directory in
-    // the whole mount (the spec explicitly rules out subdirectories), the kernel only ever
-    // asks us to list "/". Every entry is reported through filler.fill(name); the "." and
-    // ".." entries are conventional and expected even though nothing else uses them here.
+    // readdir отвечает на `ls`/`readdir(3)` для каталога. Поскольку это *единственный*
+    // каталог во всём монтировании (подкаталоги здесь принципиально не поддерживаются), ядро
+    // всегда просит список только для "/". Каждая запись сообщается через filler.fill(name);
+    // записи "." и ".." - это общепринятое соглашение, ожидаемое даже при том, что здесь ими
+    // никто больше не пользуется.
     @Override
     public int readdir(String path, DirFiller filler, long offset, FileInfo fi, int flags) {
         log.trace("READDIR path={}", path);
@@ -172,9 +178,9 @@ public class SpyFs implements FuseOperations {
         }
     }
 
-    // create() is what the kernel calls for open(O_CREAT) on a name that doesn't exist yet
-    // (it makes the file *and* opens it in one step); open() is a plain open() on a file that
-    // is already there. Both need to hand back a file handle, so they share openInternal().
+    // create() - это то, что ядро вызывает для open(O_CREAT) по имени, которого ещё нет
+    // (файл создаётся *и* открывается за один шаг); open() - обычный open() уже существующего
+    // файла. Обоим нужно вернуть file handle, поэтому они используют общий openInternal().
     @Override
     public int create(String path, int mode, FileInfo fi) {
         log.debug("CREATE path={} flags={} opts={}", path, Integer.toOctalString(fi.getFlags()), fi.getOpenFlags());
@@ -189,21 +195,21 @@ public class SpyFs implements FuseOperations {
 
     private int openInternal(String path, FileInfo fi, boolean create) {
         Path file = resolve(path);
-        // We always open READ+WRITE regardless of what the caller asked for: it keeps this
-        // method simple, and nothing here depends on enforcing O_RDONLY/O_WRONLY.
+        // Всегда открываем READ+WRITE независимо от того, что запрашивал вызывающий: так
+        // метод проще, и здесь ни на что не влияет строгое соблюдение O_RDONLY/O_WRONLY.
         Set<StandardOpenOption> opts = EnumSet.of(StandardOpenOption.READ, StandardOpenOption.WRITE);
         if (create) {
             opts.add(StandardOpenOption.CREATE);
         }
-        // libfuse 3 delivers O_TRUNC as one of these open-time flags rather than as a separate
-        // truncate() call, so this is the one place we need to look for it.
+        // В libfuse 3 O_TRUNC приходит именно как один из этих флагов открытия, а не как
+        // отдельный вызов truncate(), поэтому именно здесь мы его и проверяем.
         if (fi.getOpenFlags().contains(StandardOpenOption.TRUNCATE_EXISTING)) {
             opts.add(StandardOpenOption.TRUNCATE_EXISTING);
         }
         try {
             FileChannel channel = FileChannel.open(file, opts);
-            // Hand the kernel a file handle number of our own choosing; it will pass this
-            // exact number back on every later call against this open file (see `handles`).
+            // Отдаём ядру номер file handle по своему выбору; ядро вернёт нам ровно этот же
+            // номер в каждом следующем вызове для этого открытого файла (см. `handles`).
             long fh = nextFh++;
             fi.setFh(fh);
             handles.put(fh, new Handle(channel));
@@ -214,16 +220,16 @@ public class SpyFs implements FuseOperations {
         }
     }
 
-    // read() is a *positional* read: unlike a plain InputStream, FUSE always tells us exactly
-    // where in the file to read from (`offset`), because the kernel - not us - tracks each
-    // process's file position. We fill `buf` with up to `count` bytes, stopping early only at
-    // end-of-file, and report back how many bytes we actually managed to supply.
+    // read() - это *позиционное* чтение: в отличие от обычного InputStream, FUSE всегда
+    // сообщает нам точное место в файле (`offset`), потому что позицию в файле отслеживает
+    // ядро, а не мы. Заполняем `buf` вплоть до `count` байт, останавливаясь раньше только при
+    // достижении конца файла, и сообщаем в ответ, сколько байт реально удалось отдать.
     @Override
     public int read(String path, ByteBuffer buf, long count, long offset, FileInfo fi) {
         Handle handle = handles.get(fi.getFh());
         if (handle == null) {
-            // The kernel gave us a file handle number we never issued (or already released) -
-            // "bad file descriptor" is the standard errno for that.
+            // Ядро прислало нам номер file handle, который мы никогда не выдавали (или уже
+            // освободили) - "bad file descriptor" - стандартная errno для такого случая.
             return -errno.ebadf();
         }
         try {
@@ -242,9 +248,9 @@ public class SpyFs implements FuseOperations {
         }
     }
 
-    // write() is likewise positional (see read() above). `buf` is a native buffer that only
-    // stays valid for the duration of this call, so the first thing we do is copy it into a
-    // plain byte[] we can keep around (in Handle.part) after returning.
+    // write() тоже позиционный (см. read() выше). `buf` - это нативный буфер, который живёт
+    // только на время этого вызова, поэтому первым делом копируем его в обычный byte[],
+    // который можно сохранить (в Handle.part) и после возврата из метода.
     @Override
     public int write(String path, ByteBuffer buf, long count, long offset, FileInfo fi) {
         Handle handle = handles.get(fi.getFh());
@@ -254,9 +260,9 @@ public class SpyFs implements FuseOperations {
         byte[] data = new byte[(int) count];
         buf.get(data);
 
-        // The backing file on disk always gets the full write, regardless of what the
-        // part-tracking below decides to do - correctness of the mirrored file never depends
-        // on the logging logic.
+        // Файл в хранилище всегда получает запись полностью, что бы дальше ни решила логика
+        // отслеживания частей ниже - корректность зеркалируемого файла никогда не зависит от
+        // логики логирования.
         try {
             ByteBuffer toWrite = ByteBuffer.wrap(data);
             long written = 0;
@@ -272,25 +278,25 @@ public class SpyFs implements FuseOperations {
         return (int) count;
     }
 
-    // This is the actual "spying": we don't care what the bytes mean, only whether a program
-    // is writing its file out in order, front to back, in >= PART_MIN chunks - which is what
-    // an S3 multipart upload needs. Each open file handle tracks its own in-progress part in
-    // Handle.part; `partStart` is where in the *file* that part began.
+    // Вот тут и происходит собственно "слежка": нам не важно, что означают байты, важно лишь,
+    // пишет ли программа файл по порядку, от начала к концу, кусками >= PART_MIN - именно
+    // это нужно multipart-загрузке в S3. Каждый открытый дескриптор ведёт свою незавершённую
+    // часть в Handle.part; `partStart` - это то место *в файле*, где эта часть началась.
     private void trackPart(String path, Handle handle, long offset, byte[] data) {
         if (handle.partStart == -1) {
-            // First write seen on this handle: whatever offset it lands at becomes our
-            // starting point, since we have nothing earlier to compare it against.
+            // Первая запись, увиденная для этого дескриптора: с какого бы смещения она ни
+            // пришла, оно и становится отправной точкой - сравнивать пока не с чем.
             handle.partStart = offset;
         }
-        // "Where the next byte of this part should land" if writes keep arriving in order.
+        // "Куда должен лечь следующий байт этой части", если записи и дальше идут по порядку.
         long expected = handle.partStart + handle.part.size();
         if (offset == expected) {
-            // Exactly the next byte in sequence: fold it into the buffered part.
+            // Ровно следующий байт по порядку: добавляем его в буфер части.
             handle.part.writeBytes(data);
             handle.writes++;
             if (handle.part.size() >= PART_MIN) {
-                // Buffered enough for one S3-style part: log it and start the next one where
-                // this one left off.
+                // Накопилось достаточно для одной части в стиле S3: логируем её и начинаем
+                // следующую с того места, где закончилась эта.
                 logPart(path, handle);
                 handle.partStart += handle.part.size();
                 handle.part.reset();
@@ -298,10 +304,10 @@ public class SpyFs implements FuseOperations {
                 handle.writes = 0;
             }
         } else {
-            // Out of order: either a rewrite of bytes we already logged (offset < expected,
-            // harmless - nothing to lose) or a jump ahead that leaves a gap (offset+size >
-            // expected). Only the latter forces us to give up on the in-progress part, since
-            // it can now never be completed sequentially.
+            // Не по порядку: либо переписывание уже залогированных байт (offset < expected,
+            // безобидно - терять нечего), либо скачок вперёд, оставляющий дыру
+            // (offset+size > expected). Только второй случай заставляет нас отказаться от
+            // незавершённой части, поскольку последовательно завершить её уже нельзя.
             long dropped = 0;
             long end = offset + data.length;
             if (end > expected) {
@@ -317,8 +323,8 @@ public class SpyFs implements FuseOperations {
 
     private void logPart(String path, Handle handle) {
         byte[] bytes = handle.part.toByteArray();
-        // MD5 doubles as what S3 would hand back as a part's ETag, so this log line is enough
-        // to later verify the "uploaded" range was never silently overwritten afterwards.
+        // MD5 здесь играет роль ETag части, который вернул бы S3, так что по этой строке
+        // лога потом можно проверить, что "загруженный" диапазон никто тайком не переписал.
         log.info("PART path={} n={} off={} size={} writes={} md5={}",
                 path, handle.partNumber, handle.partStart, bytes.length, handle.writes, md5Hex(bytes));
     }
@@ -331,9 +337,10 @@ public class SpyFs implements FuseOperations {
         }
     }
 
-    // truncate() answers both truncate(2) and ftruncate(2) - resizing a file, which can also
-    // *grow* it (the grown region reads back as zero bytes). FileChannel can only shrink, so
-    // we go through RandomAccessFile.setLength() instead, which handles both directions.
+    // truncate() отвечает и за truncate(2), и за ftruncate(2) - изменение размера файла,
+    // которое может и *увеличивать* его (новая область читается как нули). FileChannel умеет
+    // только уменьшать, поэтому вместо него используем RandomAccessFile.setLength(), который
+    // работает в обе стороны.
     @Override
     public int truncate(String path, long size, FileInfo fi) {
         log.debug("TRUNCATE path={} size={}", path, size);
@@ -343,9 +350,10 @@ public class SpyFs implements FuseOperations {
             log.warn("TRUNCATE path={} error={}", path, e.toString());
             return -errno.eio();
         }
-        // A resize invalidates whatever part we were mid-way through buffering for this
-        // handle - the file layout just changed under it - so drop it and restart part
-        // tracking from the new end of file, same as a NONSEQ gap would.
+        // Изменение размера делает недействительной любую часть, которую мы копили для этого
+        // дескриптора - раскладка файла только что изменилась под ней, - поэтому сбрасываем
+        // буфер и начинаем отслеживание части заново с нового конца файла, как и при дыре
+        // (NONSEQ).
         Handle handle = fi == null ? null : handles.get(fi.getFh());
         if (handle != null && handle.part.size() > 0) {
             log.warn("TRUNCATE path={} size={} dropped={}", path, size, handle.part.size());
@@ -356,10 +364,10 @@ public class SpyFs implements FuseOperations {
         return 0;
     }
 
-    // release() is called once when the *last* reference to an open file is closed
-    // (close(2)); this is where we give back the file handle number and the FileChannel.
-    // Any part bytes still buffered at this point (`tail`) are simply too small to have ever
-    // reached PART_MIN and are dropped without comment - only DEBUG shows this happened.
+    // release() вызывается один раз, когда закрывается *последняя* ссылка на открытый файл
+    // (close(2)); именно здесь мы освобождаем номер file handle и FileChannel. Байты части,
+    // всё ещё оставшиеся в буфере (`tail`), попросту не дотянули до PART_MIN и отбрасываются
+    // без лишних слов - это видно только на уровне DEBUG.
     @Override
     public int release(String path, FileInfo fi) {
         Handle handle = handles.remove(fi.getFh());
@@ -376,9 +384,10 @@ public class SpyFs implements FuseOperations {
         }
     }
 
-    // fsync(2)/fdatasync(2): the caller wants its writes durably on disk before continuing.
-    // `datasync` nonzero means fdatasync semantics (file contents only, not metadata like
-    // timestamps), which FileChannel.force(false) matches.
+    // fsync(2)/fdatasync(2): вызывающему нужно, чтобы записи надёжно попали на диск, прежде
+    // чем продолжать. Ненулевой `datasync` означает семантику fdatasync (только содержимое
+    // файла, без метаданных вроде времени изменения) - этому соответствует
+    // FileChannel.force(false).
     @Override
     public int fsync(String path, int datasync, FileInfo fi) {
         log.debug("FSYNC path={}", path);
@@ -395,10 +404,10 @@ public class SpyFs implements FuseOperations {
         }
     }
 
-    // flush() fires on every close(2) (even when other file descriptors keep the file open),
-    // separately from release(). chmod/chown/utimens change permissions/ownership/timestamps.
-    // None of that matters for a disposable spy filesystem, so we just report success without
-    // doing anything - the kernel is satisfied as long as we return 0.
+    // flush() срабатывает на каждый close(2) (даже если файл ещё держат открытым другие
+    // дескрипторы) отдельно от release(). chmod/chown/utimens меняют права, владельца и
+    // время доступа. Для одноразовой ФС-шпиона ничто из этого не важно, поэтому просто
+    // сообщаем об успехе, ничего не делая - ядру достаточно получить 0.
     @Override
     public int flush(String path, FileInfo fi) {
         return 0;
@@ -419,9 +428,10 @@ public class SpyFs implements FuseOperations {
         return 0;
     }
 
-    // unlink(2): delete a name. rename(2): move/overwrite a name. `flags` on rename can
-    // request Linux's newer atomic-swap/no-replace semantics (renameat2); we don't support
-    // those, so any nonzero flags value is rejected up front rather than silently ignored.
+    // unlink(2): удалить имя. rename(2): переместить/перезаписать имя. `flags` в rename могут
+    // запрашивать более новую семантику Linux - атомарный обмен или запрет замены
+    // (renameat2); мы её не поддерживаем, поэтому любое ненулевое значение flags сразу
+    // отклоняется, а не молча игнорируется.
     @Override
     public int unlink(String path) {
         log.debug("UNLINK path={}", path);
@@ -449,8 +459,9 @@ public class SpyFs implements FuseOperations {
         }
     }
 
-    // statfs(2) is what backs `df`: total/free space for the filesystem. We just relay the
-    // real numbers from whatever disk `storage` lives on, in fixed 4096-byte blocks.
+    // statfs(2) - это то, на чём работает `df`: общий/свободный объём файловой системы. Мы
+    // просто передаём настоящие цифры того диска, на котором лежит `storage`, блоками по
+    // фиксированным 4096 байт.
     @Override
     public int statfs(String path, Statvfs statvfs) {
         log.trace("STATFS path={}", path);
@@ -470,19 +481,21 @@ public class SpyFs implements FuseOperations {
         }
     }
 
-    // Per-open-file state, keyed by file handle in `handles`. It lives only as long as the
-    // file stays open under that one handle - reopening the same path starts a fresh Handle
-    // and therefore fresh part tracking, since a new file descriptor means a new write
-    // pattern to watch.
+    // Состояние на одно открытие файла, хранится в `handles` по номеру file handle. Живёт
+    // ровно столько, сколько файл остаётся открытым под этим дескриптором - повторное
+    // открытие того же пути создаёт новый Handle и, соответственно, отслеживание части
+    // начинается заново, поскольку новый дескриптор - это новый, ещё не изученный паттерн
+    // записи.
     private static final class Handle {
         private final FileChannel channel;
-        // Bytes accumulated for the part currently in progress, not yet flushed to the log.
+        // Байты, накопленные для части, которая сейчас собирается, но ещё не попала в лог.
         private final ByteArrayOutputStream part = new ByteArrayOutputStream();
-        // File offset where the in-progress part began; -1 means "no write seen yet".
+        // Смещение в файле, с которого началась текущая незавершённая часть; -1 означает
+        // "ни одной записи ещё не было".
         private long partStart = -1;
-        // 1-based index of the in-progress part, purely for the log line (n=...).
+        // Номер текущей незавершённой части (с 1), нужен только для строки лога (n=...).
         private int partNumber = 1;
-        // How many write() calls contributed to the in-progress part.
+        // Сколько вызовов write() внесли вклад в текущую незавершённую часть.
         private int writes = 0;
 
         private Handle(FileChannel channel) {
