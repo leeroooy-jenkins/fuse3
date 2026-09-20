@@ -5,7 +5,7 @@
 Остановка: Ctrl+C или `docker stop` (SIGTERM) — shutdown hook размонтирует ФС.
 Если процесс убит: `fusermount3 -u <точка>` (под root — `umount <точка>`).
 
-Лог пишется в `fuse.log` в текущем каталоге и на консоль. Уровень по умолчанию — INFO
+Лог пишется в stdout. Уровень по умолчанию — INFO
 (видны только части ≥ 5 МиБ и предупреждения). Чтобы увидеть жизненный цикл файлов
 (create/open/truncate/fsync/rename/unlink/release), поднимите корневой уровень до DEBUG
 в `src/main/resources/logback.xml` (`<root level="DEBUG">`) и пересоберите.
