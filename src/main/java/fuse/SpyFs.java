@@ -16,6 +16,7 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -44,6 +45,11 @@ public class SpyFs implements FuseOperations {
     // "часть" (part) - прообраз части multipart-загрузки в S3, у которой тоже есть минимальный
     // размер.
     private static final int PART_MIN = 5 * 1024 * 1024;
+
+    // Программа-писатель создаёт под каждую сессию отдельную папку (с именем-UUID) и пишет
+    // в ней файл с этим именем. Логируем части только для него - остальные файлы (если
+    // появятся) просто зеркалируются в хранилище молча, без отслеживания частей.
+    private static final String TRACKED_FILENAME = "screen";
 
     private final Errno errno;
     private final Path storage;
@@ -98,12 +104,12 @@ public class SpyFs implements FuseOperations {
     }
 
     // jfuse регистрирует в libfuse только перечисленные здесь операции; всё остальное -
-    // подкаталоги, симлинки, xattr, проверки прав, ... - просто никогда не вызывается, и ядро
-    // само получает общую ошибку "не реализовано" (ENOSYS).
+    // симлинки, xattr, проверки прав, ... - просто никогда не вызывается, и ядро само
+    // получает общую ошибку "не реализовано" (ENOSYS).
     @Override
     public Set<Operation> supportedOperations() {
         return EnumSet.of(
-                Operation.GET_ATTR, Operation.READ_DIR,
+                Operation.GET_ATTR, Operation.READ_DIR, Operation.MKDIR, Operation.RMDIR,
                 Operation.CREATE, Operation.OPEN, Operation.READ, Operation.WRITE,
                 Operation.TRUNCATE, Operation.RELEASE, Operation.FSYNC, Operation.FLUSH,
                 Operation.CHMOD, Operation.CHOWN, Operation.UTIMENS,
@@ -112,18 +118,26 @@ public class SpyFs implements FuseOperations {
     }
 
     // В каждый вызов FUSE приходит абсолютный путь *внутри точки монтирования*
-    // (например, "/report.bin"), а не настоящий путь в файловой системе. У нас плоское
-    // монтирование, поэтому отображение на каталог-хранилище - это просто отбрасывание
-    // ведущего "/".
+    // (например, "/3f2504e0-.../screen"), а не настоящий путь в файловой системе.
+    // Отображение на каталог-хранилище - это просто отбрасывание ведущего "/"; Path.resolve()
+    // сам корректно разберёт вложенные сегменты пути, так что эта функция не меняется от
+    // глубины пути.
     private Path resolve(String path) {
         return storage.resolve(path.substring(1));
     }
 
+    // Имя файла (последний сегмент пути) - по нему решаем, логировать ли части записи.
+    private static String fileName(String path) {
+        int slash = path.lastIndexOf('/');
+        return slash < 0 ? path : path.substring(slash + 1);
+    }
+
     // getattr - это аналог stat(2) в мире FUSE: ядро вызывает его постоянно (перед open,
     // перед read, для `ls -l`, ...), чтобы узнать, существует ли путь, и если да - его тип и
-    // размер. Мы заполняем ровно то, что нужно плоской read/write-файловой системе: бит типа
-    // записи (каталог или обычный файл), объединённый через "или" с фиксированными правами,
-    // счётчик ссылок и - для файлов - реальный размер на диске.
+    // размер. Мы заполняем ровно то, что нужно: бит типа записи (каталог или обычный файл),
+    // объединённый через "или" с фиксированными правами, счётчик ссылок и - для файлов -
+    // реальный размер на диске. Каталог здесь может быть не только корнем, но и папкой сессии
+    // на любой глубине - проверяем это через resolve(path), а не только через сравнение с "/".
     // Сам jfuse сразу после монтирования опрашивает "/jfuse_mount_probe", чтобы убедиться,
     // что монтирование действительно работает; поскольку такого файла в хранилище нет, этот
     // запрос закономерно (и правильно) получает здесь ENOENT, как и любое другое отсутствующее
@@ -136,8 +150,13 @@ public class SpyFs implements FuseOperations {
             stat.setNLink((short) 2);
             return 0;
         }
-        Path file = resolve(path);
-        if (!Files.isRegularFile(file)) {
+        Path node = resolve(path);
+        if (Files.isDirectory(node)) {
+            stat.setMode(Stat.S_IFDIR | 0755);
+            stat.setNLink((short) 2);
+            return 0;
+        }
+        if (!Files.isRegularFile(node)) {
             // Операция FUSE сообщает об ошибке, возвращая *отрицательное* значение errno
             // (например, -ENOENT), а не бросая исключение - именно так libfuse ждёт ошибки.
             return -errno.enoent();
@@ -145,7 +164,7 @@ public class SpyFs implements FuseOperations {
         try {
             stat.setMode(Stat.S_IFREG | 0644);
             stat.setNLink((short) 1);
-            stat.setSize(Files.size(file));
+            stat.setSize(Files.size(node));
             return 0;
         } catch (IOException e) {
             log.warn("GETATTR path={} error={}", path, e.toString());
@@ -153,27 +172,54 @@ public class SpyFs implements FuseOperations {
         }
     }
 
-    // readdir отвечает на `ls`/`readdir(3)` для каталога. Поскольку это *единственный*
-    // каталог во всём монтировании (подкаталоги здесь принципиально не поддерживаются), ядро
-    // всегда просит список только для "/". Каждая запись сообщается через filler.fill(name);
-    // записи "." и ".." - это общепринятое соглашение, ожидаемое даже при том, что здесь ими
-    // никто больше не пользуется.
+    // readdir отвечает на `ls`/`readdir(3)` для каталога - и для корня, и для вложенной
+    // папки сессии, поэтому листим именно resolve(path), а не всегда корень хранилища.
+    // Каждая запись сообщается через filler.fill(name); записи "." и ".." - это
+    // общепринятое соглашение, ожидаемое даже при том, что здесь ими никто не пользуется.
     @Override
     public int readdir(String path, DirFiller filler, long offset, FileInfo fi, int flags) {
         log.trace("READDIR path={}", path);
         try {
             filler.fill(".");
             filler.fill("..");
-            try (var stream = Files.newDirectoryStream(storage)) {
+            try (var stream = Files.newDirectoryStream(resolve(path))) {
                 for (Path child : stream) {
-                    if (Files.isRegularFile(child)) {
-                        filler.fill(child.getFileName().toString());
-                    }
+                    filler.fill(child.getFileName().toString());
                 }
             }
             return 0;
         } catch (IOException e) {
             log.warn("READDIR path={} error={}", path, e.toString());
+            return -errno.eio();
+        }
+    }
+
+    // mkdir(2): программа-писатель создаёт под каждую сессию отдельную папку (обычно с
+    // именем-UUID) перед тем, как начать писать в неё файл. Права доступа мы, как и
+    // остальные метаданные, не отслеживаем (см. chmod ниже) - каталог всегда 0755.
+    @Override
+    public int mkdir(String path, int mode) {
+        log.debug("MKDIR path={}", path);
+        try {
+            Files.createDirectory(resolve(path));
+            return 0;
+        } catch (FileAlreadyExistsException e) {
+            return -errno.eexist();
+        } catch (IOException e) {
+            log.warn("MKDIR path={} error={}", path, e.toString());
+            return -errno.eio();
+        }
+    }
+
+    // rmdir(2): удаление (обязательно уже пустой) папки сессии - симметрично mkdir().
+    @Override
+    public int rmdir(String path) {
+        log.debug("RMDIR path={}", path);
+        try {
+            Files.delete(resolve(path));
+            return 0;
+        } catch (IOException e) {
+            log.warn("RMDIR path={} error={}", path, e.toString());
             return -errno.eio();
         }
     }
@@ -274,7 +320,12 @@ public class SpyFs implements FuseOperations {
             return -errno.eio();
         }
 
-        trackPart(path, handle, offset, data);
+        // Отслеживаем части только для файла с отслеживаемым именем (TRACKED_FILENAME) -
+        // в какой бы папке сессии он ни лежал. Остальные файлы просто зеркалируются выше,
+        // без единой строки в логе.
+        if (TRACKED_FILENAME.equals(fileName(path))) {
+            trackPart(path, handle, offset, data);
+        }
         return (int) count;
     }
 
