@@ -5,6 +5,13 @@
 Остановка: Ctrl+C или `docker stop` (SIGTERM) — shutdown hook размонтирует ФС.
 Если процесс убит: `fusermount3 -u <точка>` (под root — `umount <точка>`).
 
+Что происходит с записями, задаёт список экшенов в конструкторе `SpyFs` — порядок в
+списке и есть порядок выполнения: `StorageAction` (зеркалирование в каталог-хранилище),
+`PartLogAction` (лог частей), `S3Action` (multipart-загрузка). Ненужный экшен убирается
+оттуда же. `S3Action` требует переменных окружения `S3_ENDPOINT` и `S3_BUCKET`, ключи
+берёт из `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`. Путь `/<uuid>/screen` в хранилище
+кладётся ключом `recordings/screen/<uuid>`.
+
 Лог пишется в `fuse.log` в текущем каталоге и на консоль. Уровень по умолчанию — INFO
 (видны только части ≥ 5 МиБ и предупреждения). Чтобы увидеть жизненный цикл файлов
 (create/open/truncate/fsync/rename/unlink/release), поднимите корневой уровень до DEBUG

@@ -13,6 +13,14 @@ dependencies {
 
     implementation("org.cryptomator:jfuse:0.7.3")
     implementation("ch.qos.logback:logback-classic:1.5.19")
+
+    // AWS SDK v2 говорит с любым S3-совместимым хранилищем (MinIO/Silo в том числе).
+    // Штатные http-клиенты (apache, netty) не нужны: берём самый лёгкий, на HttpURLConnection.
+    implementation("software.amazon.awssdk:s3:2.55.1") {
+        exclude(group = "software.amazon.awssdk", module = "apache-client")
+        exclude(group = "software.amazon.awssdk", module = "netty-nio-client")
+    }
+    implementation("software.amazon.awssdk:url-connection-client:2.55.1")
 }
 
 java {
