@@ -11,7 +11,9 @@ import org.cryptomator.jfuse.api.Statvfs;
 import org.cryptomator.jfuse.api.TimeSpec;
 
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileStore;
@@ -21,30 +23,31 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.EnumSet;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
  * ЗАДАЧА. Есть внешняя программа ("программа-писатель"), которая пишет поток в файлы внутри
- * своего выходного каталога. SpyFs монтируется поверх этого каталога и перехватывает все
- * операции над файлами, чтобы с каждой записью можно было сделать сразу несколько вещей:
- * положить её на настоящий диск, посмотреть, годится ли паттерн записи под multipart-загрузку,
- * и отправить её в S3. Запуск и окружение - см. README.md.
+ * своего выходного каталога. SpyFs монтируется поверх этого каталога и прозрачно зеркалирует
+ * все операции в настоящий каталог `storage` - это его единственная обязанность как файловой
+ * системы. Всё интересное происходит сбоку: каждую запись SpyFs дополнительно отдаёт списку
+ * экшенов (см. {@link Action}), объявленному в конструкторе. Экшены ничего не решают за
+ * файловую систему - они лишь смотрят на поток записей и делают с ним что-то своё:
+ * {@link PartLogAction} проверяет, годится ли паттерн записи под multipart-загрузку, и пишет
+ * об этом в лог, {@link S3Action} заливает данные в S3. Запуск и окружение - см. README.md.
  *
  * <p>КАК ЭТО РАБОТАЕТ. FUSE ("Filesystem in Userspace") позволяет обычному процессу
  * реализовать файловую систему: ядро Linux перенаправляет каждый системный вызов программы
  * к смонтированному каталогу (open, read, write, readdir, ...) этому процессу в виде вызова
- * метода, а то, что вернёт этот класс, становится результатом системного вызова. jfuse - это
- * Java-обвязка: она превращает вызовы ядра в вызовы методов FuseOperations ниже, используя
- * под капотом C-библиотеку libfuse.
+ * метода, а то, что вернёт этот класс, становится результатом системного вызова. Поэтому
+ * SpyFs сам данные не хранит - он лишь зеркалирует чтения/записи в настоящие файлы под
+ * `storage`. jfuse - это Java-обвязка: она превращает вызовы ядра в вызовы методов
+ * FuseOperations ниже, используя под капотом C-библиотеку libfuse.
  *
- * <p>Сам SpyFs ничего не хранит и никуда не отправляет: операции над содержимым файлов он
- * раздаёт списку экшенов (см. {@link Action}), объявленному в конструкторе, а за собой
- * оставляет только пространство имён - getattr/readdir/mkdir/unlink/rename/statfs поверх
- * каталога-хранилища. Что именно происходит с байтами, смотрите в реализациях:
- * {@link StorageAction} (зеркалирование на диск), {@link PartLogAction} (лог частей,
- * там же описано, как читать его строки), {@link S3Action} (multipart-загрузка).
+ * <p>Как читать строки лога - в javadoc того экшена, который их печатает:
+ * PART/NONSEQ описаны в {@link PartLogAction}, S3 PART/S3 DONE/S3 LOST - в {@link S3Action}.
  */
 @Slf4j
 public class SpyFs implements FuseOperations {
@@ -57,25 +60,24 @@ public class SpyFs implements FuseOperations {
     private final Errno errno;
 
     /**
-     * НАСТОЯЩИЙ каталог на настоящем диске, поверх которого мы работаем. Не путать с точкой
-     * монтирования: в вызовы FUSE приходят пути ВНУТРИ точки монтирования, а resolve()
-     * переводит их в пути под `storage`. Сам SpyFs ходит сюда только за метаданными - за
-     * содержимое файлов отвечает StorageAction.
+     * НАСТОЯЩИЙ каталог на настоящем диске, в который мы зеркалируем всё, что пишут в нашу
+     * файловую систему. Не путать с точкой монтирования: в вызовы FUSE приходят пути ВНУТРИ
+     * точки монтирования, а resolve() переводит их в пути под `storage`.
      */
     private final Path storage;
 
-    /** Экшены в порядке выполнения; задаётся в конструкторе. */
-    private final List<Action> actions;
-
     /**
-     * Выданные ядру номера file handle - по ним отличаем свой дескриптор от чужого.
+     * FUSE опознаёт открытый файл по непрозрачному номеру "file handle", который МЫ САМИ
+     * выбираем в open()/create(), а ядро затем возвращает нам же в каждом следующем вызове
+     * (read, write, release, ...) через fi.getFh(). По этой карте мы находим своё состояние
+     * для конкретного открытия файла; само состояние - в классе Handle в конце файла.
      *
-     * <p>Ни это множество, ни счётчик ниже не синхронизированы, и это намеренно: монтируемся
-     * с "-s" (см. main()), поэтому libfuse отдаёт нам запросы строго по одному и все методы
-     * этого класса выполняются в одном потоке. Уберёте "-s" - понадобятся потокобезопасные
-     * коллекции и здесь, и в каждом экшене.
+     * <p>Ни карта, ни счётчик ниже не синхронизированы, и это намеренно: монтируемся с "-s"
+     * (см. main()), поэтому libfuse отдаёт нам запросы строго по одному и все методы этого
+     * класса выполняются в одном потоке. Уберёте "-s" - сюда понадобятся ConcurrentHashMap и
+     * AtomicLong.
      */
-    private final Set<Long> handles = new HashSet<>();
+    private final Map<Long, Handle> handles = new HashMap<>();
 
     /**
      * Откуда берём следующий номер file handle. Начинаем с 1, а не с 0, чтобы ноль оставался
@@ -84,13 +86,17 @@ public class SpyFs implements FuseOperations {
      */
     private long nextFh = 1;
 
+    /**
+     * Побочные действия над потоком записей, в порядке выполнения. Список объявлен здесь, в
+     * конструкторе, а не приходит снаружи: так видно, что именно навешано на write, и в каком
+     * порядке. Ненужный экшен убирается отсюда же.
+     */
+    private final List<Action> actions;
+
     public SpyFs(Errno errno, Path storage) {
         this.errno = errno;
         this.storage = storage;
-        // Порядок в этом списке - это и есть порядок выполнения: сначала байты ложатся
-        // на диск, затем из них считаются части для лога, затем они уезжают в S3.
         this.actions = List.of(
-                new StorageAction(storage),
                 new PartLogAction(),
                 new S3Action(System.getenv("S3_ENDPOINT"), System.getenv("S3_BUCKET"), "recordings")
         );
@@ -330,40 +336,40 @@ public class SpyFs implements FuseOperations {
     }
 
     private int openInternal(String path, FileInfo fi, boolean create) {
+        Path file = resolve(path);
         // Всегда открываем READ+WRITE независимо от того, что запрашивал вызывающий: так
-        // проще, и здесь ни на что не влияет строгое соблюдение O_RDONLY/O_WRONLY.
+        // метод проще, и здесь ни на что не влияет строгое соблюдение O_RDONLY/O_WRONLY.
         // Допущение: каталог-хранилище всегда доступен на запись. Если это не так, open
         // упадёт с EIO даже на чтение - случай сознательно не разбираем.
-        Set<StandardOpenOption> options = EnumSet.of(StandardOpenOption.READ, StandardOpenOption.WRITE);
+        Set<StandardOpenOption> opts = EnumSet.of(StandardOpenOption.READ, StandardOpenOption.WRITE);
         if (create) {
-            options.add(StandardOpenOption.CREATE);
+            opts.add(StandardOpenOption.CREATE);
         }
         // В libfuse 3 O_TRUNC приходит именно как один из этих флагов открытия, а не как
         // отдельный вызов truncate(), поэтому именно здесь мы его и проверяем.
         if (fi.getOpenFlags().contains(StandardOpenOption.TRUNCATE_EXISTING)) {
-            options.add(StandardOpenOption.TRUNCATE_EXISTING);
+            opts.add(StandardOpenOption.TRUNCATE_EXISTING);
         }
-        // Номер выдаём сами; ядро вернёт нам ровно его в каждом следующем вызове для
-        // этого открытого файла, и по нему же каждый экшен найдёт своё состояние.
-        long fh = nextFh++;
         try {
-            for (Action action : actions) {
-                action.open(path, fh, options);
-            }
-        } catch (Exception e) {
+            FileChannel channel = FileChannel.open(file, opts);
+            // Отдаём ядру номер file handle по своему выбору; ядро вернёт нам ровно этот же
+            // номер в каждом следующем вызове для этого открытого файла (см. `handles`).
+            long fh = nextFh++;
+            fi.setFh(fh);
+            handles.put(fh, new Handle(channel));
+            return 0;
+        } catch (IOException e) {
             log.warn("OPEN path={} error={}", path, e.toString());
             return -errno.eio();
         }
-        fi.setFh(fh);
-        handles.add(fh);
-        return 0;
     }
 
     /**
      * read() - это ПОЗИЦИОННОЕ чтение: в отличие от обычного InputStream, FUSE всегда
      * сообщает нам точное место в файле (`offset`), потому что позицию в файле отслеживает
-     * ядро, а не мы. Отдаёт данные первый экшен, который их хранит (см. Action.read);
-     * недостающее до `count` ядро само добьёт нулями - так и должно быть на конце файла.
+     * ядро, а не мы. Заполняем `buf` вплоть до `count` байт, останавливаясь раньше только при
+     * достижении конца файла, и сообщаем в ответ, сколько байт реально удалось отдать
+     * (недостающее до `count` ядро само добьёт нулями - так и должно быть на конце файла).
      *
      * <p>Здесь и в write() нет log.trace, в отличие от остальных операций: это горячий путь,
      * лог на нём заметно замедлил бы саму измеряемую программу. Жизненный цикл файлов и так
@@ -371,92 +377,120 @@ public class SpyFs implements FuseOperations {
      */
     @Override
     public int read(String path, ByteBuffer buf, long count, long offset, FileInfo fi) {
-        if (!handles.contains(fi.getFh())) {
-            // Ядро прислало номер file handle, который мы никогда не выдавали (или уже
+        Handle handle = handles.get(fi.getFh());
+        if (handle == null) {
+            // Ядро прислало нам номер file handle, который мы никогда не выдавали (или уже
             // освободили) - "bad file descriptor" - стандартная errno для такого случая.
             return -errno.ebadf();
         }
         try {
-            for (Action action : actions) {
-                int read = action.read(path, fi.getFh(), buf, count, offset);
-                if (read >= 0) {
-                    return read;
+            long total = 0;
+            while (total < count) {
+                int r = handle.channel.read(buf, offset + total);
+                // r < 0 - конец файла; r == 0 - в `buf` больше нет места (jfuse обычно даёт
+                // буфер ровно на `count` байт, но API этого не обещает). Выходим в обоих
+                // случаях: иначе `total` перестал бы расти и цикл стал бы вечным, а с "-s"
+                // это подвесило бы всю файловую систему, а не один вызов.
+                if (r <= 0) {
+                    break;
                 }
+                total += r;
             }
-            return 0;
-        } catch (Exception e) {
+            return (int) total;
+        } catch (IOException e) {
             log.warn("READ path={} error={}", path, e.toString());
             return -errno.eio();
         }
     }
 
     /**
-     * write() тоже позиционный (см. read() выше). `buf` - это нативный буфер, который живёт
-     * только на время вызова, поэтому первым делом копируем его в обычный byte[]: экшены
-     * держат эти байты у себя и после возврата из метода.
-     * <p>
-     * Ошибка любого экшена (включая сетевую от S3) превращается в EIO для программы-писателя:
-     * молча терять данные хуже, чем честно сказать, что запись не удалась.
+     * write() тоже позиционный (см. read() выше). `buf` - это нативный буфер,
+     * который живёт только на время этого вызова.
+     * Поэтому первым делом копируем его в обычный byte[], который можно сохранить (в Handle.part)
+     * и после возврата из метода.
      */
     @Override
     public int write(String path, ByteBuffer buf, long count, long offset, FileInfo fi) {
-        if (!handles.contains(fi.getFh())) {
+        Handle handle = handles.get(fi.getFh());
+        if (handle == null) {
             return -errno.ebadf();
         }
         // `count` объявлен как long, но ядро никогда не присылает за один вызов больше
         // max_write (по умолчанию 128 КиБ), поэтому сужение до int здесь безопасно.
         byte[] data = new byte[(int) count];
         buf.get(data);
+
+        // Файл в хранилище всегда получает запись полностью, что бы дальше ни решила логика
+        // отслеживания частей ниже - корректность зеркалируемого файла никогда не зависит от
+        // логики логирования.
+        try {
+            ByteBuffer toWrite = ByteBuffer.wrap(data);
+            long written = 0;
+            while (toWrite.hasRemaining()) {
+                written += handle.channel.write(toWrite, offset + written);
+            }
+        } catch (IOException e) {
+            log.warn("WRITE path={} error={}", path, e.toString());
+            return -errno.eio();
+        }
+
+        // Байты уже на диске - дальше отдаём их экшенам. Сейчас они работают синхронно,
+        // прямо в этом вызове, но ничего в контракте этого не требует: экшену отдают копию
+        // байтов, и он волен сложить их в очередь и разобрать в фоне.
+        // Ошибка экшена превращается в EIO для программы-писателя: молча терять данные,
+        // которые должны были уехать в S3, хуже, чем честно сказать, что запись не удалась.
         try {
             for (Action action : actions) {
                 action.write(path, fi.getFh(), offset, data);
             }
-            return (int) count;
         } catch (Exception e) {
-            log.warn("WRITE path={} error={}", path, e.toString());
+            log.warn("WRITE path={} action error={}", path, e.toString());
             return -errno.eio();
         }
+        return (int) count;
     }
 
     /**
      * truncate() отвечает и за truncate(2), и за ftruncate(2) - изменение размера файла,
-     * которое может и УВЕЛИЧИВАТЬ его. Дескриптора может не быть вовсе (ядро пришло по
-     * пути) - тогда экшены получают fh = -1.
-     *
-     * <p>`fi` заполнен, только когда обрезание пришло как ftruncate(2), то есть по уже
-     * открытому дескриптору. У truncate(2) по пути (`truncate`, `> file`) открытого
-     * дескриптора нет. Оговорка: если тот же файл открыт ДРУГИМ дескриптором, его состояние
-     * в экшенах останется протухшим - этот случай мы не покрываем.
+     * которое может и УВЕЛИЧИВАТЬ его (новая область читается как нули). FileChannel умеет
+     * только уменьшать, поэтому вместо него используем RandomAccessFile.setLength(), который
+     * работает в обе стороны.
      */
     @Override
     public int truncate(String path, long size, FileInfo fi) {
         log.debug("TRUNCATE path={} size={}", path, size);
-        long fh = fi == null ? -1 : fi.getFh();
-        try {
-            for (Action action : actions) {
-                action.truncate(path, fh, size);
-            }
-            return 0;
-        } catch (Exception e) {
+        try (RandomAccessFile raf = new RandomAccessFile(resolve(path).toFile(), "rw")) {
+            raf.setLength(size);
+        } catch (IOException e) {
             log.warn("TRUNCATE path={} error={}", path, e.toString());
             return -errno.eio();
         }
+        // Экшенам об изменении размера не сообщаем: они видят только записи. Разъехавшееся
+        // после обрезания состояние они починят сами на следующей же записи - та придёт не по
+        // ожидаемому смещению, и это штатно обработанный случай (в PartLogAction - NONSEQ).
+        return 0;
     }
 
     /**
      * release() вызывается один раз, когда закрывается ПОСЛЕДНЯЯ ссылка на открытый файл
-     * (close(2)). Для экшенов это сигнал дописать хвост и закрыться: StorageAction закрывает
-     * канал, S3Action завершает multipart-загрузку.
+     * (close(2)). Именно здесь мы освобождаем номер file handle и FileChannel.
+     *
+     * <p>Это единственное, кроме write(), о чём мы сообщаем экшенам, и сообщаем не из
+     * вежливости: без сигнала "файл закончился" S3Action не смог бы ни дослать хвост меньше
+     * 5 МиБ, ни вызвать completeMultipartUpload - объект в бакете просто не появился бы.
      */
     @Override
     public int release(String path, FileInfo fi) {
-        if (!handles.remove(fi.getFh())) {
+        Handle handle = handles.remove(fi.getFh());
+        if (handle == null) {
             return -errno.ebadf();
         }
+        log.debug("RELEASE path={}", path);
         try {
             for (Action action : actions) {
                 action.release(path, fi.getFh());
             }
+            handle.channel.close();
             return 0;
         } catch (Exception e) {
             log.warn("RELEASE path={} error={}", path, e.toString());
@@ -466,21 +500,21 @@ public class SpyFs implements FuseOperations {
 
     /**
      * fsync(2)/fdatasync(2): вызывающему нужно, чтобы записи надёжно попали на диск, прежде
-     * чем продолжать. Ненулевой `datasync` означает семантику fdatasync (только содержимое
-     * файла, без метаданных вроде времени изменения).
+     * чем продолжать. Ненулевой `datasync` означает семантику fdatasync
+     * (только содержимое файла, без метаданных вроде времени изменения) - этому соответствует
+     * FileChannel.force(false).
      */
     @Override
     public int fsync(String path, int datasync, FileInfo fi) {
         log.debug("FSYNC path={}", path);
-        if (!handles.contains(fi.getFh())) {
+        Handle handle = handles.get(fi.getFh());
+        if (handle == null) {
             return -errno.ebadf();
         }
         try {
-            for (Action action : actions) {
-                action.fsync(path, fi.getFh(), datasync == 0);
-            }
+            handle.channel.force(datasync == 0);
             return 0;
-        } catch (Exception e) {
+        } catch (IOException e) {
             log.warn("FSYNC path={} error={}", path, e.toString());
             return -errno.eio();
         }
@@ -488,8 +522,9 @@ public class SpyFs implements FuseOperations {
 
     /**
      * flush() срабатывает на каждый close(2) (даже если файл ещё держат открытым другие
-     * дескрипторы) отдельно от release(). Сбрасывать нам тут нечего: write() уже раздал байты
-     * экшенам, а настоящий sync делает fsync() выше. Ядру достаточно получить 0.
+     * дескрипторы) отдельно от release(). Сбрасывать нам тут нечего: write() уже отдал байты
+     * в FileChannel, а на диск их допишет ядро; настоящий sync делает fsync() выше. Ядру
+     * достаточно получить 0.
      */
     @Override
     public int flush(String path, FileInfo fi) {
@@ -527,10 +562,6 @@ public class SpyFs implements FuseOperations {
      * запрашивать более новую семантику Linux - атомарный обмен или запрет замены
      * (renameat2); мы её не поддерживаем, поэтому любое ненулевое значение flags сразу
      * отклоняется, а не молча игнорируется.
-     *
-     * <p>Экшенам об удалении и переименовании не сообщаем: они работают с содержимым уже
-     * открытых файлов, а это операции над пространством имён. Объект, уже уехавший в S3,
-     * после `rm` в точке монтирования там и останется.
      */
     @Override
     public int unlink(String path) {
@@ -567,8 +598,7 @@ public class SpyFs implements FuseOperations {
 
     /**
      * statfs(2) - это то, на чём работает `df`: общий/свободный объём файловой системы.
-     * Мы просто передаём настоящие цифры того диска, на котором лежит `storage`, блоками по
-     * фиксированным 4096 байт.
+     * Мы просто передаём настоящие цифры того диска, на котором лежит `storage`, блоками по фиксированным 4096 байт.
      */
     @Override
     public int statfs(String path, Statvfs statvfs) {
@@ -593,6 +623,21 @@ public class SpyFs implements FuseOperations {
         } catch (IOException e) {
             log.warn("STATFS path={} error={}", path, e.toString());
             return -errno.eio();
+        }
+    }
+
+    /**
+     * Состояние на одно открытие файла, хранится в `handles` по номеру file handle. Живёт
+     * ровно столько, сколько файл остаётся открытым под этим дескриптором - повторное
+     * открытие того же пути создаёт новый Handle и, соответственно, отслеживание части
+     * начинается заново, поскольку новый дескриптор - это новый, ещё не изученный паттерн
+     * записи.
+     */
+    private static final class Handle {
+        private final FileChannel channel;
+
+        private Handle(FileChannel channel) {
+            this.channel = channel;
         }
     }
 }

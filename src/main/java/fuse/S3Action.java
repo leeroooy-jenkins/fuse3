@@ -10,13 +10,11 @@ import software.amazon.awssdk.services.s3.model.UploadPartResponse;
 
 import java.io.ByteArrayInputStream;
 import java.net.URI;
-import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * Грузит содержимое файла в S3-совместимое хранилище multipart-загрузкой, по одной
@@ -69,17 +67,23 @@ public class S3Action implements Action {
         return prefix + "/" + relative.substring(slash + 1) + "/" + relative.substring(0, slash);
     }
 
-    @Override
-    public void open(String path, long fh, Set<StandardOpenOption> options) {
-        String key = key(path);
-        String uploadId = s3.createMultipartUpload(b -> b.bucket(bucket).key(key)).uploadId();
-        uploads.put(fh, new Upload(key, uploadId));
-        log.debug("S3 INIT key={} uploadId={}", key, uploadId);
+    /**
+     * Загрузку начинаем лениво, на первой записи в файл: об открытии нам не сообщают, а
+     * заводить multipart-загрузку под файл, в который так ничего и не напишут, ни к чему -
+     * её потом пришлось бы отменять.
+     */
+    private Upload upload(String path, long fh) {
+        return uploads.computeIfAbsent(fh, key -> {
+            String objectKey = key(path);
+            String uploadId = s3.createMultipartUpload(b -> b.bucket(bucket).key(objectKey)).uploadId();
+            log.debug("S3 INIT key={} uploadId={}", objectKey, uploadId);
+            return new Upload(objectKey, uploadId);
+        });
     }
 
     @Override
     public void write(String path, long fh, long offset, byte[] data) {
-        Upload upload = uploads.get(fh);
+        Upload upload = upload(path, fh);
         int at = (int) (offset - upload.start);
         if (at < 0) {
             // Запись попала в диапазон, который S3 уже принял. Часть неизменяема - починить
@@ -107,22 +111,6 @@ public class S3Action implements Action {
                 upload.key, number, upload.start, length, response.eTag());
         upload.start += length;
         upload.length = 0;
-    }
-
-    @Override
-    public void truncate(String path, long fh, long size) {
-        Upload upload = fh == -1 ? null : uploads.get(fh);
-        if (upload == null) {
-            return;
-        }
-        long inBuffer = size - upload.start;
-        if (inBuffer >= 0 && inBuffer <= upload.length) {
-            // Обрезали в пределах ещё не отправленного буфера - просто забываем хвост.
-            upload.length = (int) inBuffer;
-        } else {
-            log.warn("S3 TRUNCATE key={} size={} partStart={} (не укладывается в текущий буфер)",
-                    upload.key, size, upload.start);
-        }
     }
 
     @Override

@@ -3,13 +3,11 @@ package fuse;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.ByteArrayOutputStream;
-import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * Ничего не хранит и никуда не отправляет - только смотрит, пишет ли программа файл
@@ -46,13 +44,10 @@ public class PartLogAction implements Action {
     private final Map<Long, Part> parts = new HashMap<>();
 
     @Override
-    public void open(String path, long fh, Set<StandardOpenOption> options) {
-        parts.put(fh, new Part());
-    }
-
-    @Override
     public void write(String path, long fh, long offset, byte[] data) {
-        Part part = parts.get(fh);
+        // Состояние заводим лениво, на первой записи: об открытии файла нам не сообщают,
+        // да и незачем - у файла, в который не писали, и частей никаких нет.
+        Part part = parts.computeIfAbsent(fh, key -> new Part());
         if (part.start == -1) {
             // Первая запись для этого дескриптора: с какого бы смещения она ни пришла,
             // оно и становится отправной точкой - сравнивать пока не с чем.
@@ -102,23 +97,10 @@ public class PartLogAction implements Action {
     }
 
     @Override
-    public void truncate(String path, long fh, long size) {
-        Part part = fh == -1 ? null : parts.get(fh);
-        if (part != null && part.buffer.size() > 0) {
-            // Изменение размера делает недействительной часть, которую мы копили:
-            // раскладка файла только что поехала под ней.
-            log.warn("TRUNCATE path={} size={} dropped={}", path, size, part.buffer.size());
-            part.buffer.reset();
-            part.writes = 0;
-            part.start = size;
-        }
-    }
-
-    @Override
     public void release(String path, long fh) {
         Part part = parts.remove(fh);
         // Остаток меньше PART_MIN до части не дотянул и никуда не поехал - виден только на DEBUG.
-        log.debug("RELEASE path={} tail={}", path, part == null ? 0 : part.buffer.size());
+        log.debug("PART tail path={} size={}", path, part == null ? 0 : part.buffer.size());
     }
 
     private static String md5Hex(byte[] data) {
