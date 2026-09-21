@@ -35,7 +35,7 @@ tasks.shadowJar {
     mergeServiceFiles()
     manifest {
         attributes(
-            "Main-Class" to "fuse.SpyFs",
+            "Main-Class" to "fuse.Main",
             "Enable-Native-Access" to "ALL-UNNAMED"
         )
     }

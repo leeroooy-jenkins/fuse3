@@ -1,6 +1,8 @@
 package fuse;
 
 import lombok.extern.slf4j.Slf4j;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
@@ -29,7 +31,7 @@ import java.util.concurrent.TimeUnit;
  * PART_MIN байт, completeMultipartUpload после закрытия файла.
  * <p>
  * Раскладка ключей отличается от файловой: ФС получает /&lt;uuid&gt;/screen, а в S3 удобнее
- * группировать по типу записи, поэтому ключ выходит recordings/screen/&lt;uuid&gt;.
+ * группировать по типу записи, поэтому ключ выходит screen/&lt;uuid&gt;.
  *
  * <p>ЧТО ГДЕ ВЫПОЛНЯЕТСЯ. Обращения к сети вынесены на виртуальные потоки, потому что синхронная
  * загрузка занимала до 84% времени потока FUSE, а он один на всю ФС (монтируемся с "-s") - пока он
@@ -78,7 +80,6 @@ public class S3Action implements Action, AutoCloseable {
 
     private final S3Client s3;
     private final String bucket;
-    private final String prefix;
 
     /** По виртуальному потоку на задачу: они дешёвые и на JDK 25 не пиннят носителя (JEP 491). */
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
@@ -92,19 +93,17 @@ public class S3Action implements Action, AutoCloseable {
     /** Завершения закрытых файлов, которые ещё не доехали - их дожидается close(). */
     private final java.util.Set<CompletableFuture<Void>> finishing = ConcurrentHashMap.newKeySet();
 
-    public S3Action(String endpoint, String bucket, String prefix) {
-        if (endpoint == null || bucket == null) {
+    public S3Action(String endpoint, String bucket, String accessKey, String secretKey) {
+        if (endpoint == null || bucket == null || accessKey == null || secretKey == null) {
             throw new IllegalStateException(
-                    "S3Action: задайте переменные окружения S3_ENDPOINT и S3_BUCKET "
-                            + "(ключи доступа берутся из AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)");
+                    "S3Action: задайте переменные окружения S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY");
         }
         this.bucket = bucket;
-        this.prefix = prefix;
         this.s3 = S3Client.builder()
                 .endpointOverride(URI.create(endpoint))
-                // Регион MinIO не использует, но SDK его требует. Ключи доступа SDK сам
-                // возьмёт из стандартной цепочки: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY,
-                // ~/.aws/credentials и так далее.
+                .credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create(accessKey, secretKey)))
+                // Регион MinIO не использует, но SDK его требует.
                 .region(Region.US_EAST_1)
                 // MinIO адресует бакет путём (host/bucket/key), а не поддоменом.
                 .forcePathStyle(true)
@@ -116,17 +115,21 @@ public class S3Action implements Action, AutoCloseable {
                         .apiCallTimeout(Duration.ofSeconds(60))
                         .build())
                 .build();
+
+        log.info("S3 buckets: {}", this.s3.listBuckets().buckets());
         log.info("S3 INIT endpoint={} bucket={} inFlight={}MiB", endpoint, bucket, IN_FLIGHT_BYTES / 1024 / 1024);
     }
 
-    /** /&lt;uuid&gt;/screen -&gt; recordings/screen/&lt;uuid&gt;: имя файла становится папкой, папка - именем. */
+    /**
+     * /&lt;uuid&gt;/screen -&gt; screen/&lt;uuid&gt;: имя файла становится папкой, папка - именем.
+     */
     private String key(String path) {
         String relative = path.substring(1);
         int slash = relative.lastIndexOf('/');
         if (slash < 0) {
-            return prefix + "/" + relative;
+            return relative;
         }
-        return prefix + "/" + relative.substring(slash + 1) + "/" + relative.substring(0, slash);
+        return relative.substring(slash + 1) + "/" + relative.substring(0, slash);
     }
 
     @Override
