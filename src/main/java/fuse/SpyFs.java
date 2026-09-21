@@ -12,9 +12,11 @@ import org.cryptomator.jfuse.api.TimeSpec;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileStore;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
@@ -24,26 +26,62 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * FUSE ("Filesystem in Userspace") позволяет обычному процессу реализовать файловую систему:
- * ядро Linux перенаправляет каждый системный вызов программы к смонтированному каталогу
- * (open, read, write, readdir, ...) этому процессу в виде вызова метода, а то, что вернёт
- * этот класс, становится результатом системного вызова.
- * jfuse - это Java-обвязка: она превращает вызовы ядра в вызовы методов FuseOperations
- * ниже, используя под капотом C-библиотеку libfuse.
- * <p>
- * Сам SpyFs данные не хранит и никуда не отправляет: операции над содержимым файлов он
- * раздаёт списку экшенов (см. {@link Action}), а за собой оставляет только пространство
- * имён - getattr/readdir/mkdir/unlink/rename/statfs поверх каталога-хранилища.
+ * ЗАДАЧА. Есть внешняя программа ("программа-писатель"), которая пишет поток в файлы внутри
+ * своего выходного каталога. SpyFs монтируется поверх этого каталога и перехватывает все
+ * операции над файлами, чтобы с каждой записью можно было сделать сразу несколько вещей:
+ * положить её на настоящий диск, посмотреть, годится ли паттерн записи под multipart-загрузку,
+ * и отправить её в S3. Запуск и окружение - см. README.md.
+ *
+ * <p>КАК ЭТО РАБОТАЕТ. FUSE ("Filesystem in Userspace") позволяет обычному процессу
+ * реализовать файловую систему: ядро Linux перенаправляет каждый системный вызов программы
+ * к смонтированному каталогу (open, read, write, readdir, ...) этому процессу в виде вызова
+ * метода, а то, что вернёт этот класс, становится результатом системного вызова. jfuse - это
+ * Java-обвязка: она превращает вызовы ядра в вызовы методов FuseOperations ниже, используя
+ * под капотом C-библиотеку libfuse.
+ *
+ * <p>Сам SpyFs ничего не хранит и никуда не отправляет: операции над содержимым файлов он
+ * раздаёт списку экшенов (см. {@link Action}), объявленному в конструкторе, а за собой
+ * оставляет только пространство имён - getattr/readdir/mkdir/unlink/rename/statfs поверх
+ * каталога-хранилища. Что именно происходит с байтами, смотрите в реализациях:
+ * {@link StorageAction} (зеркалирование на диск), {@link PartLogAction} (лог частей,
+ * там же описано, как читать его строки), {@link S3Action} (multipart-загрузка).
  */
 @Slf4j
 public class SpyFs implements FuseOperations {
 
+    /**
+     * Фабрика платформенных констант из errno.h (ENOENT, EIO, EBADF, ...), которую даёт jfuse.
+     * Числовые значения этих констант различаются между Linux/macOS/Windows, поэтому мы их не
+     * хардкодим, а спрашиваем у библиотеки. Приходит извне - см. main().
+     */
     private final Errno errno;
+
+    /**
+     * НАСТОЯЩИЙ каталог на настоящем диске, поверх которого мы работаем. Не путать с точкой
+     * монтирования: в вызовы FUSE приходят пути ВНУТРИ точки монтирования, а resolve()
+     * переводит их в пути под `storage`. Сам SpyFs ходит сюда только за метаданными - за
+     * содержимое файлов отвечает StorageAction.
+     */
     private final Path storage;
+
+    /** Экшены в порядке выполнения; задаётся в конструкторе. */
     private final List<Action> actions;
 
-    /** Выданные ядру номера file handle - по ним отличаем свой дескриптор от чужого. */
+    /**
+     * Выданные ядру номера file handle - по ним отличаем свой дескриптор от чужого.
+     *
+     * <p>Ни это множество, ни счётчик ниже не синхронизированы, и это намеренно: монтируемся
+     * с "-s" (см. main()), поэтому libfuse отдаёт нам запросы строго по одному и все методы
+     * этого класса выполняются в одном потоке. Уберёте "-s" - понадобятся потокобезопасные
+     * коллекции и здесь, и в каждом экшене.
+     */
     private final Set<Long> handles = new HashSet<>();
+
+    /**
+     * Откуда берём следующий номер file handle. Начинаем с 1, а не с 0, чтобы ноль оставался
+     * заведомо невыданным значением: незаполненный fi.getFh() тогда не совпадёт случайно с
+     * настоящим дескриптором и честно упрётся в EBADF.
+     */
     private long nextFh = 1;
 
     public SpyFs(Errno errno, Path storage) {
@@ -58,6 +96,13 @@ public class SpyFs implements FuseOperations {
         );
     }
 
+    /**
+     * Точка входа: собирает и монтирует файловую систему, после чего блокируется навсегда.
+     *
+     * @param args [0] - точка монтирования (каталог, поверх которого встаём),
+     *             [1] - каталог-хранилище (куда зеркалируем),
+     *             [2...] - опции libfuse, пробрасываются как есть (например, "-o allow_other")
+     */
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
             System.err.println("usage: SpyFs <mountpoint> <storage> [libfuse options]");
@@ -82,19 +127,34 @@ public class SpyFs implements FuseOperations {
 
         // "-s" велит libfuse работать в один поток: ядро присылает нам по одному запросу за
         // раз, поэтому read()/write()/и т.д. никогда не выполняются параллельно и не нужна
-        // блокировка. "-f" (остаться на переднем плане) и саму точку монтирования jfuse
-        // добавляет сам.
+        // блокировка (см. поле `handles`). "-f" (остаться на переднем плане) и саму точку
+        // монтирования jfuse добавляет сам.
+        // Арифметика ниже: args[0] и args[1] мы уже разобрали (точка монтирования и
+        // хранилище), всё остальное - опции libfuse, которые пробрасываем как есть. Отсюда
+        // длина массива (args.length - 2) + 1 и копирование с args[2] в flags[1]: место
+        // flags[0] занимает "-s".
         String[] flags = new String[args.length - 2 + 1];
         flags[0] = "-s";
         System.arraycopy(args, 2, flags, 1, args.length - 2);
 
+        // Первый аргумент mount() - fsname: имя, под которым ФС покажется в колонке устройства
+        // у `mount` и `df`. Больше ни на что не влияет.
         // mount() блокируется, пока файловая система реально не примонтируется, а затем
         // возвращает управление, пока цикл обработки событий FUSE продолжает работать в
-        // фоновом потоке. Без join() ниже JVM тут же завершилась бы и размонтировала ФС.
+        // фоновом потоке.
         fuse.mount("fuse", mountPoint, flags);
+        // join() на ТЕКУЩЕМ потоке не завершается никогда: поток ждёт собственной смерти. Это
+        // намеренная вечная блокировка main - без неё JVM тут же завершилась бы и
+        // размонтировала ФС. Выходим отсюда только по сигналу, и тогда отработает shutdown
+        // hook, зарегистрированный выше.
         Thread.currentThread().join();
     }
 
+    /**
+     * Через этот метод jfuse спрашивает, какой набор констант errno использовать: они нужны
+     * самой библиотеке, чтобы отвечать ядру за нас - например, вернуть ENOSYS на операцию,
+     * которой нет в supportedOperations().
+     */
     @Override
     public Errno errno() {
         return errno;
@@ -122,6 +182,11 @@ public class SpyFs implements FuseOperations {
      * Отображение на каталог-хранилище - это просто отбрасывание ведущего "/"; Path.resolve()
      * сам корректно разберёт вложенные сегменты пути, так что эта функция не меняется от
      * глубины пути.
+     *
+     * <p>Про path traversal: выбраться из хранилища путём вида "/../../etc/passwd" нельзя -
+     * "." и ".." разбирает само ядро, ещё на своей стороне, и до FUSE-вызова доходит уже
+     * нормализованный путь. Сюда попадают только имена, реально лежащие внутри точки
+     * монтирования.
      */
     private Path resolve(String path) {
         return storage.resolve(path.substring(1));
@@ -138,23 +203,35 @@ public class SpyFs implements FuseOperations {
      * что монтирование действительно работает; поскольку такого файла в хранилище нет, этот
      * запрос закономерно (и правильно) получает здесь ENOENT, как и любое другое отсутствующее
      * имя.
+     *
+     * <p>Времена (mtime/atime/ctime) намеренно не заполняем: задаче они не нужны, поэтому
+     * `ls -l` покажет для наших файлов начало эпохи. Понадобится реалистичный вывод - брать
+     * их из Files.readAttributes() и класть в stat.
+     *
+     * <p>Параметр `fi` не используем: он заполнен, только если getattr пришёл по уже открытому
+     * дескриптору (fstat(2)), а нам в любом случае хватает пути - ответ от этого не меняется.
      */
     @Override
     public int getattr(String path, Stat stat, FileInfo fi) {
         log.trace("GETATTR path={}", path);
         if ("/".equals(path)) {
+            // Корень отвечаем, не заглядывая на диск: он обязан быть виден всегда, даже если
+            // каталог-хранилище ещё не создан, - иначе монтирование просто не состоится.
             stat.setMode(Stat.S_IFDIR | 0755);
+            // Счётчик жёстких ссылок, unix-соглашение: у каталога их минимум 2 (запись о нём
+            // в родителе плюс "." внутри него самого), у обычного файла - 1. Реально
+            // подкаталоги мы не считаем: это число `ls -l` только печатает в своей колонке.
             stat.setNLink((short) 2);
             return 0;
         }
         Path node = resolve(path);
         if (Files.isDirectory(node)) {
             stat.setMode(Stat.S_IFDIR | 0755);
-            stat.setNLink((short) 2);
+            stat.setNLink((short) 2); // см. про счётчик ссылок в ветке с корнем выше
             return 0;
         }
         if (!Files.isRegularFile(node)) {
-            // Операция FUSE сообщает об ошибке, возвращая *отрицательное* значение errno
+            // Операция FUSE сообщает об ошибке, возвращая ОТРИЦАТЕЛЬНОЕ значение errno
             // (например, -ENOENT), а не бросая исключение - именно так libfuse ждёт ошибки.
             return -errno.enoent();
         }
@@ -174,6 +251,11 @@ public class SpyFs implements FuseOperations {
      * папки сессии, поэтому листим именно resolve(path), а не всегда корень хранилища.
      * Каждая запись сообщается через filler.fill(name); записи "." и ".." - это
      * общепринятое соглашение, ожидаемое даже при том, что здесь ими никто не пользуется.
+     *
+     * <p>Параметры `offset` и `flags` игнорируем: offset нужен для постраничной отдачи очень
+     * больших каталогов (ядро может попросить продолжить с середины), а мы всегда отдаём весь
+     * каталог за один вызов. По той же причине не проверяем результат filler.fill() - он
+     * сообщил бы, что буфер ядра кончился и пора остановиться.
      */
     @Override
     public int readdir(String path, DirFiller filler, long offset, FileInfo fi, int flags) {
@@ -217,6 +299,13 @@ public class SpyFs implements FuseOperations {
         try {
             Files.delete(resolve(path));
             return 0;
+        } catch (NoSuchFileException e) {
+            // Ожидаемые ошибки переводим в точные errno: иначе пользователь вместо привычных
+            // "No such file or directory" и "Directory not empty" увидел бы от `rmdir`
+            // невнятное "Input/output error" (так работает ветка с EIO ниже).
+            return -errno.enoent();
+        } catch (DirectoryNotEmptyException e) {
+            return -errno.enotempty();
         } catch (IOException e) {
             log.warn("RMDIR path={} error={}", path, e.toString());
             return -errno.eio();
@@ -226,6 +315,8 @@ public class SpyFs implements FuseOperations {
     // create() - это то, что ядро вызывает для open(O_CREAT) по имени, которого ещё нет
     // (файл создаётся И открывается за один шаг); open() - обычный open() уже существующего
     // файла. Обоим нужно вернуть file handle, поэтому они используют общий openInternal().
+    // Параметр `mode` (права создаваемого файла) игнорируем по той же причине, что и в
+    // mkdir(): метаданные мы не отслеживаем, файл в хранилище получает права по umask.
     @Override
     public int create(String path, int mode, FileInfo fi) {
         log.debug("CREATE path={} flags={} opts={}", path, Integer.toOctalString(fi.getFlags()), fi.getOpenFlags());
@@ -241,6 +332,8 @@ public class SpyFs implements FuseOperations {
     private int openInternal(String path, FileInfo fi, boolean create) {
         // Всегда открываем READ+WRITE независимо от того, что запрашивал вызывающий: так
         // проще, и здесь ни на что не влияет строгое соблюдение O_RDONLY/O_WRONLY.
+        // Допущение: каталог-хранилище всегда доступен на запись. Если это не так, open
+        // упадёт с EIO даже на чтение - случай сознательно не разбираем.
         Set<StandardOpenOption> options = EnumSet.of(StandardOpenOption.READ, StandardOpenOption.WRITE);
         if (create) {
             options.add(StandardOpenOption.CREATE);
@@ -269,7 +362,12 @@ public class SpyFs implements FuseOperations {
     /**
      * read() - это ПОЗИЦИОННОЕ чтение: в отличие от обычного InputStream, FUSE всегда
      * сообщает нам точное место в файле (`offset`), потому что позицию в файле отслеживает
-     * ядро, а не мы. Отдаёт данные первый экшен, который их хранит (см. Action.read).
+     * ядро, а не мы. Отдаёт данные первый экшен, который их хранит (см. Action.read);
+     * недостающее до `count` ядро само добьёт нулями - так и должно быть на конце файла.
+     *
+     * <p>Здесь и в write() нет log.trace, в отличие от остальных операций: это горячий путь,
+     * лог на нём заметно замедлил бы саму измеряемую программу. Жизненный цикл файлов и так
+     * виден по create/open/truncate/release.
      */
     @Override
     public int read(String path, ByteBuffer buf, long count, long offset, FileInfo fi) {
@@ -305,6 +403,8 @@ public class SpyFs implements FuseOperations {
         if (!handles.contains(fi.getFh())) {
             return -errno.ebadf();
         }
+        // `count` объявлен как long, но ядро никогда не присылает за один вызов больше
+        // max_write (по умолчанию 128 КиБ), поэтому сужение до int здесь безопасно.
         byte[] data = new byte[(int) count];
         buf.get(data);
         try {
@@ -322,6 +422,11 @@ public class SpyFs implements FuseOperations {
      * truncate() отвечает и за truncate(2), и за ftruncate(2) - изменение размера файла,
      * которое может и УВЕЛИЧИВАТЬ его. Дескриптора может не быть вовсе (ядро пришло по
      * пути) - тогда экшены получают fh = -1.
+     *
+     * <p>`fi` заполнен, только когда обрезание пришло как ftruncate(2), то есть по уже
+     * открытому дескриптору. У truncate(2) по пути (`truncate`, `> file`) открытого
+     * дескриптора нет. Оговорка: если тот же файл открыт ДРУГИМ дескриптором, его состояние
+     * в экшенах останется протухшим - этот случай мы не покрываем.
      */
     @Override
     public int truncate(String path, long size, FileInfo fi) {
@@ -381,40 +486,62 @@ public class SpyFs implements FuseOperations {
         }
     }
 
-    // flush() срабатывает на каждый close(2) (даже если файл ещё держат открытым другие
-    // дескрипторы) отдельно от release(). chmod/chown/utimens меняют права, владельца и
-    // время доступа. Для одноразовой ФС-шпиона ничто из этого не важно, поэтому просто
-    // сообщаем об успехе, ничего не делая - ядру достаточно получить 0.
+    /**
+     * flush() срабатывает на каждый close(2) (даже если файл ещё держат открытым другие
+     * дескрипторы) отдельно от release(). Сбрасывать нам тут нечего: write() уже раздал байты
+     * экшенам, а настоящий sync делает fsync() выше. Ядру достаточно получить 0.
+     */
     @Override
     public int flush(String path, FileInfo fi) {
         return 0;
     }
 
+    /**
+     * chmod(2): смена прав доступа. Метаданные мы не отслеживаем - права в getattr() жёстко
+     * зашиты (0755/0644), менять нечего. Рапортуем об успехе, чтобы вызывающий не падал.
+     */
     @Override
     public int chmod(String path, int mode, FileInfo fi) {
         return 0;
     }
 
+    /**
+     * chown(2): смена владельца и группы. Не отслеживаем, как и права выше, - возвращаем успех.
+     */
     @Override
     public int chown(String path, int uid, int gid, FileInfo fi) {
         return 0;
     }
 
+    /**
+     * utimens(2): смена времён доступа и изменения. getattr() времена не отдаёт вовсе, так что
+     * хранить их негде - возвращаем успех, чтобы `touch` и копирующие утилиты не падали.
+     */
     @Override
     public int utimens(String path, TimeSpec atime, TimeSpec mtime, FileInfo fi) {
         return 0;
     }
 
-    // unlink(2): удалить имя. rename(2): переместить/перезаписать имя. `flags` в rename могут
-    // запрашивать более новую семантику Linux - атомарный обмен или запрет замены
-    // (renameat2); мы её не поддерживаем, поэтому любое ненулевое значение flags сразу
-    // отклоняется, а не молча игнорируется.
+    /**
+     * unlink(2): удалить имя. rename(2): переместить/перезаписать имя. `flags` в rename могут
+     * запрашивать более новую семантику Linux - атомарный обмен или запрет замены
+     * (renameat2); мы её не поддерживаем, поэтому любое ненулевое значение flags сразу
+     * отклоняется, а не молча игнорируется.
+     *
+     * <p>Экшенам об удалении и переименовании не сообщаем: они работают с содержимым уже
+     * открытых файлов, а это операции над пространством имён. Объект, уже уехавший в S3,
+     * после `rm` в точке монтирования там и останется.
+     */
     @Override
     public int unlink(String path) {
         log.debug("UNLINK path={}", path);
         try {
             Files.delete(resolve(path));
             return 0;
+        } catch (NoSuchFileException e) {
+            // Как и в rmdir(): без этой ветки `rm` на несуществующем имени сообщил бы
+            // "Input/output error" вместо привычного "No such file or directory".
+            return -errno.enoent();
         } catch (IOException e) {
             log.warn("UNLINK path={} error={}", path, e.toString());
             return -errno.eio();
@@ -430,6 +557,8 @@ public class SpyFs implements FuseOperations {
         try {
             Files.move(resolve(oldpath), resolve(newpath), StandardCopyOption.REPLACE_EXISTING);
             return 0;
+        } catch (NoSuchFileException e) {
+            return -errno.enoent();
         } catch (IOException e) {
             log.warn("RENAME path={} error={}", oldpath, e.toString());
             return -errno.eio();
@@ -446,13 +575,20 @@ public class SpyFs implements FuseOperations {
         log.trace("STATFS path={}", path);
         try {
             FileStore store = Files.getFileStore(storage);
+            // statvfs отчитывается в блоках, а FileStore отдаёт байты, поэтому делим на
+            // фиксированный размер блока. 4096 - обычный размер блока ext4; конкретное
+            // значение не важно, лишь бы в него делили и его же сообщали ядру.
             long bsize = 4096;
             statvfs.setBsize(bsize);
             statvfs.setFrsize(bsize);
             statvfs.setBlocks(store.getTotalSpace() / bsize);
             statvfs.setBfree(store.getUnallocatedSpace() / bsize);
             statvfs.setBavail(store.getUsableSpace() / bsize);
+            // 255 - предел длины имени файла в ext4 и большинстве Linux-ФС; FileStore его не
+            // отдаёт, поэтому подставляем константой.
             statvfs.setNameMax(255);
+            // files/ffree (счётчики инодов, колонки `df -i`) не заполняем: своей таблицы
+            // инодов у нас нет, считать нечего - `df -i` покажет по нашей ФС нули.
             return 0;
         } catch (IOException e) {
             log.warn("STATFS path={} error={}", path, e.toString());

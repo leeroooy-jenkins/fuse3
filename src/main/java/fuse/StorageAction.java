@@ -43,7 +43,11 @@ public class StorageAction implements Action {
         long total = 0;
         while (total < count) {
             int r = channel.read(buf, offset + total);
-            if (r < 0) {
+            // r < 0 - конец файла; r == 0 - в `buf` больше нет места (jfuse обычно даёт
+            // буфер ровно на `count` байт, но API этого не обещает). Выходим в обоих
+            // случаях: иначе `total` перестал бы расти и цикл стал бы вечным, а с "-s"
+            // это подвесило бы всю файловую систему, а не один вызов.
+            if (r <= 0) {
                 break;
             }
             total += r;

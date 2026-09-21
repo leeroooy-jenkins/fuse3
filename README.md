@@ -12,7 +12,7 @@
 берёт из `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`. Путь `/<uuid>/screen` в хранилище
 кладётся ключом `recordings/screen/<uuid>`.
 
-Лог пишется в `fuse.log` в текущем каталоге и на консоль. Уровень по умолчанию — INFO
+Лог пишется в stdout. Уровень по умолчанию — INFO
 (видны только части ≥ 5 МиБ и предупреждения). Чтобы увидеть жизненный цикл файлов
 (create/open/truncate/fsync/rename/unlink/release), поднимите корневой уровень до DEBUG
 в `src/main/resources/logback.xml` (`<root level="DEBUG">`) и пересоберите.
