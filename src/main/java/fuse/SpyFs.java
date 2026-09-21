@@ -50,7 +50,7 @@ import java.util.Set;
  * PART/NONSEQ описаны в {@link PartLogAction}, S3 PART/S3 DONE/S3 LOST - в {@link S3Action}.
  */
 @Slf4j
-public class SpyFs implements FuseOperations {
+public class SpyFs implements FuseOperations, AutoCloseable {
 
     /**
      * Фабрика платформенных констант из errno.h (ENOENT, EIO, EBADF, ...), которую даёт jfuse.
@@ -109,6 +109,26 @@ public class SpyFs implements FuseOperations {
      *             [1] - каталог-хранилище (куда зеркалируем),
      *             [2...] - опции libfuse, пробрасываются как есть (например, "-o allow_other")
      */
+    /**
+     * Вызывается при остановке процесса, уже ПОСЛЕ размонтирования - новых вызовов ФС не будет.
+     * Экшену может быть что доделать: S3Action на этом месте дожидается догрузки частей, иначе
+     * JVM ушла бы молча (его виртуальные потоки демонские), потеряв хвосты и оставив в бакете
+     * висящие multipart-загрузки. Знать про это интерфейсу Action не нужно - спрашиваем тех, кто
+     * сам объявил себя AutoCloseable.
+     */
+    @Override
+    public void close() {
+        for (Action action : actions) {
+            if (action instanceof AutoCloseable closeable) {
+                try {
+                    closeable.close();
+                } catch (Exception e) {
+                    log.warn("close {} failed: {}", action.getClass().getSimpleName(), e.toString());
+                }
+            }
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
             System.err.println("usage: SpyFs <mountpoint> <storage> [libfuse options]");
@@ -120,15 +140,19 @@ public class SpyFs implements FuseOperations {
         // builder.errno() даёт нам настоящие константы errno.h платформы (EIO, ENOENT, ...),
         // так как их числовые значения различаются между Linux/macOS/Windows.
         var builder = Fuse.builder();
-        var fuse = builder.build(new SpyFs(builder.errno(), storage));
+        var spyFs = new SpyFs(builder.errno(), storage);
+        var fuse = builder.build(spyFs);
         // Если JVM убивают (Ctrl+C, `docker stop`/SIGTERM), сначала аккуратно размонтируемся,
-        // а не оставляем висячую точку монтирования.
+        // а не оставляем висячую точку монтирования. Порядок важен: после fuse.close() ядро
+        // больше не пришлёт ни одного вызова, и только тогда экшенам есть смысл доделывать
+        // начатое - иначе они дожидались бы догрузки, пока в них продолжают писать.
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
                 fuse.close();
             } catch (Exception e) {
                 log.warn("close failed: {}", e.toString());
             }
+            spyFs.close();
         }));
 
         // "-s" велит libfuse работать в один поток: ядро присылает нам по одному запросу за
