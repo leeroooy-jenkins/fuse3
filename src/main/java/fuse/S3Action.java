@@ -1,6 +1,8 @@
 package fuse;
 
 import lombok.extern.slf4j.Slf4j;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
@@ -29,24 +31,25 @@ import java.util.Map;
 @Slf4j
 public class S3Action implements Action {
 
-    /** Минимальный размер части multipart-загрузки в S3; меньше может быть только последняя. */
+    /**
+     * Минимальный размер части multipart-загрузки в S3; меньше может быть только последняя.
+     */
     private static final int PART_MIN = 5 * 1024 * 1024;
 
     private final S3Client s3;
     private final String bucket;
-    private final String prefix;
     private final Map<Long, Upload> uploads = new HashMap<>();
 
-    public S3Action(String endpoint, String bucket, String prefix) {
-        if (endpoint == null || bucket == null) {
+    public S3Action(String endpoint, String bucket, String accessKey, String secretKey) {
+        if (endpoint == null || bucket == null || accessKey == null || secretKey == null) {
             throw new IllegalStateException(
-                    "S3Action: задайте переменные окружения S3_ENDPOINT и S3_BUCKET "
-                            + "(ключи доступа берутся из AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)");
+                    "S3Action: задайте переменные окружения S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY");
         }
         this.bucket = bucket;
-        this.prefix = prefix;
         this.s3 = S3Client.builder()
                 .endpointOverride(URI.create(endpoint))
+                .credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create(accessKey, secretKey)))
                 // Регион MinIO не использует, но SDK его требует. Ключи доступа SDK сам
                 // возьмёт из стандартной цепочки: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY,
                 // ~/.aws/credentials и так далее.
@@ -55,16 +58,20 @@ public class S3Action implements Action {
                 .forcePathStyle(true)
                 .httpClient(UrlConnectionHttpClient.create())
                 .build();
+
+        log.info("S3 buckets: {}", this.s3.listBuckets().buckets());
     }
 
-    /** /&lt;uuid&gt;/screen -&gt; recordings/screen/&lt;uuid&gt;: имя файла становится папкой, папка - именем. */
+    /**
+     * /<uuid>/screen -> recordings/screen/<uuid>: имя файла становится папкой, папка - именем.
+     */
     private String key(String path) {
         String relative = path.substring(1);
         int slash = relative.lastIndexOf('/');
         if (slash < 0) {
-            return prefix + "/" + relative;
+            return relative;
         }
-        return prefix + "/" + relative.substring(slash + 1) + "/" + relative.substring(0, slash);
+        return relative.substring(slash + 1) + "/" + relative.substring(0, slash);
     }
 
     /**
@@ -134,12 +141,16 @@ public class S3Action implements Action {
         log.info("S3 DONE key={} parts={} size={}", upload.key, upload.parts.size(), upload.start);
     }
 
-    /** Одна незавершённая multipart-загрузка. */
+    /**
+     * Одна незавершённая multipart-загрузка.
+     */
     private static final class Upload {
         private final String key;
         private final String uploadId;
         private final List<CompletedPart> parts = new ArrayList<>();
-        /** Накопленные байты следующей части; buffer[0] соответствует смещению start в файле. */
+        /**
+         * Накопленные байты следующей части; buffer[0] соответствует смещению start в файле.
+         */
         private byte[] buffer = new byte[PART_MIN];
         private int length;
         private long start;
@@ -149,7 +160,9 @@ public class S3Action implements Action {
             this.uploadId = uploadId;
         }
 
-        /** Кладёт data по смещению at внутри буфера, раздвигая его при необходимости. */
+        /**
+         * Кладёт data по смещению at внутри буфера, раздвигая его при необходимости.
+         */
         private void put(int at, byte[] data) {
             int end = at + data.length;
             if (end > buffer.length) {
